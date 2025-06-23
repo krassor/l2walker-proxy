@@ -2,7 +2,9 @@ package socks5proxy
 
 import (
 	"app/main.go/internal/config"
-	"bytes"
+	"strconv"
+
+	//"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -14,17 +16,17 @@ import (
 	"github.com/armon/go-socks5"
 )
 
+type XorKeys struct {
+	EncodeXorKey []byte
+	DecodeXorKey []byte
+}
 type Cache interface {
 	Save(ctx context.Context, ipPort string, xorKeys XorKeys) error
 	Get(ctx context.Context, ipPort string) (XorKeys, error)
 	Delete(ctx context.Context, ipPort string) error
 }
 
-type XorKeys struct {
-	EncodeXorKey []byte
-	DecodeXorKey []byte
-}
-
+// socks5proxy структура, которая содержит настройки и сервер SOCKS5 Proxy
 type socks5proxy struct {
 	config          *config.Config
 	log             *slog.Logger
@@ -44,22 +46,83 @@ type LoggingDialer struct {
 // TrafficLogger реализует net.Conn для логирования трафика
 type TrafficLogger struct {
 	net.Conn
-	logger          *slog.Logger
-	buf             bytes.Buffer
+	logger *slog.Logger
+	//buf             bytes.Buffer
 	la2ProtocolData la2ProtocolData
 }
 
+// Read читает данные с логированием
+func (t *TrafficLogger) Read(b []byte) (int, error) {
+	op := "TrafficLogger.Read()"
+	log := t.logger.With(
+		slog.String("op", op),
+	)
+
+	n, err := t.Conn.Read(b)
+	if err != nil {
+		return 0, err
+	}
+
+	if n > 0 {
+		data := b[:n]
+
+		log.Debug("Received data",
+			slog.String("length", strconv.Itoa(n)),
+			slog.String("data", hex.EncodeToString(data)),
+		)
+		//Запускаем анализ данных
+		if err := t.DataProcessing(context.TODO(), log, data); err != nil {
+			return 0, err
+		}
+
+		log.Debug("Finish DataProcessing()")
+
+		// // Записываем данные в буфер для дальнейшей передачи
+		// if _, err := t.buf.Write(data); err != nil {
+		// 	return 0, err
+		//}
+	}
+	return n, nil
+}
+
+// Write отправляет данные с логированием
+func (t *TrafficLogger) Write(b []byte) (int, error) {
+	op := "TrafficLogger.Write()"
+	log := t.logger.With(
+		slog.String("op", op),
+	)
+	log.Debug("Sending data",
+		slog.String("length", strconv.Itoa(len(b))),
+		slog.String("data", hex.EncodeToString(b)),
+	)
+	return t.Conn.Write(b)
+}
+
+// la2ProtocolData содержит данные протокола для la2
 type la2ProtocolData struct {
 	xorKeysCache Cache
 }
 
+// Dial создает соединение с логированием
 func (d *LoggingDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	op := "Dial()"
+	log := d.logger.With(
+		slog.String("op", op),
+	)
+
 	conn, err := net.Dial(network, addr)
 	if err != nil {
+		log.Error("Failed to create connection", slog.String("error", err.Error()))
 		return nil, err
 	}
+
+	log.Info("Successfully created connection")
+
 	d.trafficLogger.Conn = conn
 	d.trafficLogger.logger = d.logger
+
+	log.Debug("Return created TrafficLogger")
+
 	return d.trafficLogger, nil
 }
 
@@ -106,39 +169,7 @@ func New(logger *slog.Logger, config *config.Config, xorKeysCache Cache) *socks5
 	}
 }
 
-func (t *TrafficLogger) Read(b []byte) (int, error) {
-	op := "TrafficLogger.Read()"
-	log := t.logger.With(
-		slog.String("op", op),
-	)
-
-	n, err := t.Conn.Read(b)
-	if err != nil {
-		return 0, err
-	}
-
-	if n > 0 {
-		data := b[:n]
-		log.Debug("Received data", "length", n, "data", hex.EncodeToString(data))
-
-		//Запускаем анализ данных
-		if err := t.DataProcessing(context.TODO(), log, data); err != nil {
-			return 0, err
-		}
-
-		// Записываем данные в буфер для дальнейшей передачи
-		if _, err := t.buf.Write(data); err != nil {
-			return 0, err
-		}
-	}
-	return n, nil
-}
-
-func (t *TrafficLogger) Write(b []byte) (int, error) {
-	t.logger.Debug("Sending data", "length", len(b), "data", hex.EncodeToString(b))
-	return t.Conn.Write(b)
-}
-
+// Start запускает SOCKS5 прокси сервер
 func (s *socks5proxy) Start() {
 	// Настраиваем логгер
 	op := "Start()"
@@ -161,6 +192,7 @@ func (s *socks5proxy) Start() {
 	}
 }
 
+// Shutdown останавливает SOCKS5 прокси сервер
 func (s *socks5proxy) Shutdown(ctx context.Context) error {
 	for {
 		select {
