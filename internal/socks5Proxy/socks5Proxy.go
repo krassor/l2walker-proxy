@@ -71,7 +71,7 @@ func (t *TrafficLogger) Read(b []byte) (int, error) {
 			slog.String("data", hex.EncodeToString(data)),
 		)
 		//Запускаем анализ данных
-		if err := t.DataProcessing(context.TODO(), log, data); err != nil {
+		if err := t.ReadDataProcessing(context.TODO(), log, data); err != nil {
 			return 0, err
 		}
 
@@ -91,11 +91,22 @@ func (t *TrafficLogger) Write(b []byte) (int, error) {
 	log := t.logger.With(
 		slog.String("op", op),
 	)
-	log.Debug("Sending data",
+	log.Debug("raw data",
 		slog.String("length", strconv.Itoa(len(b))),
 		slog.String("data", hex.EncodeToString(b)),
 	)
-	return t.Conn.Write(b)
+
+	newData, err := t.WriteDataProcessing(context.TODO(), log, b)
+	if err != nil {
+		return 0, err
+	}
+
+		log.Debug("Sending data",
+		slog.String("length", strconv.Itoa(len(newData))),
+		slog.String("data", hex.EncodeToString(newData)),
+	)
+
+	return t.Conn.Write(newData)
 }
 
 // la2ProtocolData содержит данные протокола для la2

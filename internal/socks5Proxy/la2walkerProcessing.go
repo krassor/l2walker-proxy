@@ -8,17 +8,21 @@ import (
 	"strconv"
 )
 
-func (t *TrafficLogger) DataProcessing(ctx context.Context, logger *slog.Logger, data []byte) error {
+func (t *TrafficLogger) ReadDataProcessing(ctx context.Context, logger *slog.Logger, rawData []byte) error {
 	op := "DataProcessing()"
 	log := logger.With(
 		slog.String("Op", op),
 	)
 
+	packetType := byte(0)
+	packetData := make([]byte, len(rawData)-3)
+	var err error
+
 	// Анализируем и модифицируем данные
-	ok, foundedXorKey := findFirstXorKey(data, t.logger)
+	ok, foundedXorKey := findFirstXorKey(rawData, t.logger)
 	if ok {
-		err := t.la2ProtocolData.xorKeysCache.Save(
-			context.TODO(),
+		err = t.la2ProtocolData.xorKeysCache.Save(
+			ctx,
 			t.Conn.LocalAddr().String(),
 			XorKeys{EncodeXorKey: foundedXorKey, DecodeXorKey: foundedXorKey},
 		)
@@ -26,7 +30,7 @@ func (t *TrafficLogger) DataProcessing(ctx context.Context, logger *slog.Logger,
 			return err
 		}
 
-		log.Info(
+		log.Debug(
 			"FirstXorKey stored",
 			slog.String("LocalAddr", t.Conn.LocalAddr().String()),
 			slog.String("RemoteAddr", t.Conn.RemoteAddr().String()),
@@ -36,14 +40,50 @@ func (t *TrafficLogger) DataProcessing(ctx context.Context, logger *slog.Logger,
 		return nil
 	}
 
-	if err := t.Decode2(ctx, data); err != nil {
-		return err
+	packetType, packetData, err = t.Decode(ctx, rawData)
+
+	switch packetType {
+		case 0x4A: 
+			// Пакет для декодирования
+			msgSay2, err := parsePacketSay2(packetData)
+			if err != nil {
+				return err
+			}
+			log.Info("Say2 packet", slog.Any("msgSay2", msgSay2))
+		default :
 	}
 
 	return nil
 }
 
-// analyzeAndModifyPacket анализирует пакет и выполняет требуемые модификации
+func (t *TrafficLogger) WriteDataProcessing(ctx context.Context, logger *slog.Logger, rawData []byte) ([]byte, error) {
+	op := "WriteDataProcessing()"
+	log := logger.With(
+		slog.String("Op", op),
+	)
+
+	packetType := byte(0)
+	packetData := make([]byte, len(rawData)-3)
+	var err error
+
+	packetType, packetData, err = t.MiddlewareDecode(ctx, rawData)
+	if err != nil {
+		return nil, err
+	}
+
+	switch packetType {
+	case 0x01:
+		modifiedData, err := 
+	default:
+	}
+
+
+	return modifiedData, nil
+}
+
+// findFirstXorKey проверяет, является ли первый пакет ключом XOR
+// и возвращает его, если таковой имеется
+// bool - true, если ключ найден, []byte - ключ
 func findFirstXorKey(data []byte, logger *slog.Logger) (bool, []byte) {
 	op := "findXorKey()"
 	log := logger.With(
@@ -71,12 +111,41 @@ func findFirstXorKey(data []byte, logger *slog.Logger) (bool, []byte) {
 }
 
 // Encrypt (Client -> Server)
-func Encrypt(raw []byte, key_cs []byte, size int) {
+func (t *TrafficLogger) Encrypt(ctx context.Context, inputData []byte) error {
+	op := "Encrypt()"
+	log := t.logger.With(
+		slog.String("Op", op),
+	)
+
+	input := make([]byte, len(inputData)-2)
+	copy(input, inputData[2:])
+
+	xorKeys, err := t.la2ProtocolData.xorKeysCache.Get(ctx, t.Conn.LocalAddr().String())
+	if err != nil {
+		return err
+	}
+
+	log.Debug(
+		"Get xorKeysCache",
+		slog.String("DecodeKey", hex.EncodeToString(xorKeys.DecodeXorKey)),
+		slog.String("EncodeKey", hex.EncodeToString(xorKeys.EncodeXorKey)),
+		slog.String("Raw Data", hex.EncodeToString(input)),
+	)
+
+	key_cs := make([]byte, len(xorKeys.EncodeXorKey))
+	copy(key_cs, xorKeys.EncodeXorKey)
+
+	if len(key_cs) == 0 {
+		return fmt.Errorf("keyCS length is 0")
+	}
+
+	size := len(input)
+
 	temp := 0
 	for i := 0; i < size; i++ {
-		temp2 := int(raw[i] & 0xFF)
-		raw[i] = byte(temp2 ^ int(key_cs[i&7])&0xFF ^ temp)
-		temp = int(raw[i])
+		temp2 := int(input[i] & 0xFF)
+		input[i] = byte(temp2 ^ int(key_cs[i&7])&0xFF ^ temp)
+		temp = int(input[i])
 	}
 	old := int64(key_cs[0] & 0xFF)
 	old |= int64(key_cs[1]) << 8 & 0xFF00
@@ -87,6 +156,23 @@ func Encrypt(raw []byte, key_cs []byte, size int) {
 	key_cs[1] = byte(old >> 8 & 0xFF)
 	key_cs[2] = byte(old >> 16 & 0xFF)
 	key_cs[3] = byte(old >> 24 & 0xFF)
+
+	updatedXorKeys := XorKeys{EncodeXorKey: key_cs, DecodeXorKey: xorKeys.DecodeXorKey}
+
+	err = t.la2ProtocolData.xorKeysCache.Save(ctx, t.Conn.LocalAddr().String(), updatedXorKeys)
+	if err != nil {
+		return err
+	}
+
+	log.Debug(
+		"Updated xorKeysCache",
+		slog.String("DecodeKey", hex.EncodeToString(updatedXorKeys.DecodeXorKey)),
+		slog.String("EncodeKey", hex.EncodeToString(updatedXorKeys.EncodeXorKey)),
+		slog.String("Encrypted Data Length", strconv.Itoa(len(input))),
+		slog.String("Encrypted Data", hex.EncodeToString(input)),
+	)
+
+	return nil
 }
 
 /*// Decode (Server -> Client)
@@ -170,7 +256,11 @@ func (t *TrafficLogger) Decode(ctx context.Context, inputData []byte) error {
 	return nil
 }*/
 
-func (t *TrafficLogger) Decode(ctx context.Context, inputData []byte) error {
+// Decode decodes the input data using the provided XOR keys and returns the decoded data.
+// It takes a context and input data as parameters.
+// It returns the decoded packet type and packet data, or an error if decoding fails.
+// This function modify XOR keys. It is used to decode data received from the server to the client.
+func (t *TrafficLogger) Decode(ctx context.Context, inputData []byte) (byte, []byte, error) {
 	op := "Decode()"
 	log := t.logger.With(
 		slog.String("Op", op),
@@ -184,7 +274,7 @@ func (t *TrafficLogger) Decode(ctx context.Context, inputData []byte) error {
 
 	xorKeys, err := t.la2ProtocolData.xorKeysCache.Get(ctx, t.Conn.LocalAddr().String())
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	log.Debug(
@@ -198,7 +288,7 @@ func (t *TrafficLogger) Decode(ctx context.Context, inputData []byte) error {
 	copy(key_sc, xorKeys.DecodeXorKey)
 
 	if len(key_sc) == 0 {
-		return fmt.Errorf("keySC length is 0")
+		return 0, nil, fmt.Errorf("keySC length is 0")
 	}
 
 	size := len(input)
@@ -226,7 +316,7 @@ func (t *TrafficLogger) Decode(ctx context.Context, inputData []byte) error {
 
 	err = t.la2ProtocolData.xorKeysCache.Save(ctx, t.Conn.LocalAddr().String(), updatedXorKeys)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	log.Debug(
@@ -237,7 +327,90 @@ func (t *TrafficLogger) Decode(ctx context.Context, inputData []byte) error {
 		slog.String("Decoded Data", hex.EncodeToString(input)),
 	)
 
-	return nil
+	packetType := byte(input[0])
+	packetData := make([]byte, len(input)-1)
+	packetData = input[1:]
+
+	return packetType, packetData, nil
+}
+
+// MiddlewareDecode decodes the input data using the provided XOR keys and returns the decoded data.
+// It takes a context and input data as parameters.
+// It returns the decoded packet type and packet data, or an error if decoding fails.
+// This function does not modify XOR keys, just decode the data. It is used to decode data transmitted from the client to the server.
+func (t *TrafficLogger) MiddlewareDecode(ctx context.Context, inputData []byte) (byte, []byte, error) {
+	op := "MiddlewareDecode()"
+	log := t.logger.With(
+		slog.String("Op", op),
+	)
+
+	i := 0
+	j := 0
+
+	input := make([]byte, len(inputData)-2)
+	copy(input, inputData[2:])
+
+	xorKeys, err := t.la2ProtocolData.xorKeysCache.Get(ctx, t.Conn.LocalAddr().String())
+	if err != nil {
+		return 0, nil, err
+	}
+
+	log.Debug(
+		"Get xorKeysCache",
+		slog.String("DecodeKey", hex.EncodeToString(xorKeys.DecodeXorKey)),
+		slog.String("EncodeKey", hex.EncodeToString(xorKeys.EncodeXorKey)),
+		slog.String("Encoded Data", hex.EncodeToString(input)),
+	)
+
+	key_sc := make([]byte, len(xorKeys.EncodeXorKey))
+	copy(key_sc, xorKeys.EncodeXorKey)
+
+	if len(key_sc) == 0 {
+		return 0, nil, fmt.Errorf("keySC length is 0")
+	}
+
+	size := len(input)
+
+	for k := 0; k < size; k++ {
+		i1 := int(input[k] & 0xFF)
+		input[k] = byte(i1 ^ int(key_sc[j])&0xFF ^ i)
+		i = i1
+		j++
+		if j > 7 {
+			j = 0
+		}
+	}
+
+	packetType := byte(input[0])
+	packetData := make([]byte, len(input)-1)
+	packetData = input[1:]
+
+	// l := int64(key_sc[0] & 0xFF)
+	// l |= int64(key_sc[1]) << 8 & 0xFF00
+	// l |= int64(key_sc[2]) << 16 & 0xFF0000
+	// l |= int64(key_sc[3]) << 24 & 0xFF000000
+	// l += int64(size)
+	// key_sc[0] = byte(l & 255)
+	// key_sc[1] = byte(l >> 8 & 255)
+	// key_sc[2] = byte(l >> 16 & 255)
+	// key_sc[3] = byte(l >> 24 & 255)
+
+	// updatedXorKeys := XorKeys{EncodeXorKey: xorKeys.EncodeXorKey, DecodeXorKey: key_sc}
+
+	// err = t.la2ProtocolData.xorKeysCache.Save(ctx, t.Conn.LocalAddr().String(), updatedXorKeys)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// log.Debug(
+	// 	"Updated xorKeysCache",
+	// 	slog.String("DecodeKey", hex.EncodeToString(updatedXorKeys.DecodeXorKey)),
+	// 	slog.String("EncodeKey", hex.EncodeToString(updatedXorKeys.EncodeXorKey)),
+	// 	slog.String("Decoded Data Length", strconv.Itoa(len(input))),
+	// 	slog.String("Decoded Data", hex.EncodeToString(input)),
+	// )
+
+	return packetType, packetData, nil
 }
 
 // reverseSlice reverses the order of elements in the provided byte slice.
